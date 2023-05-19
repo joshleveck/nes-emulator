@@ -12,6 +12,7 @@ mod cpu;
 mod memory;
 mod cartridge;
 mod opcodes;
+mod ppu;
 
 #[macro_use]
 extern crate lazy_static;
@@ -55,7 +56,7 @@ fn handle_user_input(cpu: &mut cpu::Cpu, event_pump: &mut sdl2::EventPump) {
     }
 }
 
-fn read_screen_state(cpu: &cpu::Cpu, frame: &mut [u8; 32 * 3 * 32]) -> bool {
+fn read_screen_state(cpu: &mut cpu::Cpu, frame: &mut [u8; 32 * 3 * 32]) -> bool {
     let mut frame_idx = 0;
     let mut update = false;
     for i in 0x0200..0x600 {

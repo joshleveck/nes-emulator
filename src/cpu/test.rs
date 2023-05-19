@@ -17,7 +17,7 @@ pub fn trace(cpu: &mut Cpu) -> String {
     {
         (0, 0)
     } else {
-        let addr = cpu.get_operand_address(&opcode.mode);
+        let (addr, _) = cpu.get_operand_address(&opcode.mode);
         let val = cpu.memory.read(addr);
         (addr, val)
     };

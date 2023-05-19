@@ -1,8 +1,12 @@
+use crate::ppu::Ppu;
+
 use super::cartridge::Cartridge;
 
 pub struct Memory {
     memory: [u8; 2048],
     cartridge: Cartridge,
+    ppu: Ppu,
+    cycles: usize,
 }
 
 const RAM: u16 = 0x0000;
@@ -12,30 +16,43 @@ const PPU_REGISTERS_MIRRORS_END: u16 = 0x3FFF;
 
 impl Memory {
     pub fn new(cartridge: Cartridge) -> Self {
+        let chr_rom = cartridge.chr_rom.clone();
+        let mirroring = cartridge.mirroring.clone();
         return Memory {
             memory: [0; 2048],
             cartridge,
+            ppu: Ppu::new(chr_rom, mirroring),
+            cycles: 0,
         };
     }
 
-    pub fn read(&self, addr: u16) -> u8 {
+    pub fn tick(&mut self, cycles: u8) {
+        self.cycles += cycles as usize;
+        self.ppu.tick(cycles * 3);
+    }
+
+    pub fn read(&mut self, addr: u16) -> u8 {
         match addr {
-            RAM ..= RAM_MIRRORS_END => {
+            RAM..=RAM_MIRRORS_END => {
                 let mirror_down_addr = addr & 0b00000111_11111111;
                 self.memory[mirror_down_addr as usize]
-            },
-            PPU_REGISTERS ..= PPU_REGISTERS_MIRRORS_END => {
+            }
+            0x2000 | 0x2001 | 0x2003 | 0x2005 | 0x2006 | 0x4014 => {
+                panic!("Attempted to read from write only PPU register {:X}", addr)
+            }
+            0x2007 => self.ppu.read_data(),
+            0x2008..=PPU_REGISTERS_MIRRORS_END => {
                 let _mirror_down_addr = addr & 0b00100000_00000111;
-                todo!("Not supported yet");
-            },
-            0x8000 ..= 0xFFFF => {
+                self.read(_mirror_down_addr)
+            }
+            0x8000..=0xFFFF => {
                 let mut addr = addr;
                 addr -= 0x8000;
                 if self.cartridge.prg_rom.len() == 0x4000 && addr >= 0x4000 {
                     addr %= 0x4000;
                 }
                 self.cartridge.prg_rom[addr as usize]
-            },
+            }
             _ => {
                 println!("Ignoring memory access {}", addr);
                 0
@@ -45,24 +62,32 @@ impl Memory {
 
     pub fn write(&mut self, addr: u16, data: u8) {
         match addr {
-            RAM ..= RAM_MIRRORS_END => {
+            RAM..=RAM_MIRRORS_END => {
                 let mirror_down_addr = addr & 0b00000111_11111111;
                 self.memory[mirror_down_addr as usize] = data
-            },
-            PPU_REGISTERS ..= PPU_REGISTERS_MIRRORS_END => {
+            }
+            0x2000 => self.ppu.write_to_ctrl(data),
+            0x2001 => self.ppu.write_to_mask(data),
+            0x2002 => panic!("Attempted to write to read only PPU register 0x2002"),
+            0x2003 => self.ppu.write_to_oam_addr(data),
+            0x2004 => self.ppu.write_to_oam_data(data),
+            0x2005 => self.ppu.write_to_scroll(data),
+            0x2006 => self.ppu.write_to_ppu_addr(data),
+            0x2007 => self.ppu.write_to_data(data),
+            0x2008..=PPU_REGISTERS_MIRRORS_END => {
                 let _mirror_down_addr = addr & 0b00100000_00000111;
-                todo!("Not supported yet");
-            },
-            0x8000 ..= 0xFFFF => {
+                self.write(_mirror_down_addr, data)
+            }
+            0x8000..=0xFFFF => {
                 panic!("Cannot write to Cartridge")
-            },
+            }
             _ => {
                 println!("Ignoring memory access {}", addr);
             }
         }
     }
 
-    pub fn read_u16(&self, addr: u16) -> u16 {
+    pub fn read_u16(&mut self, addr: u16) -> u16 {
         let lo = self.read(addr) as u16;
         let hi = self.read(addr + 1) as u16;
         (hi << 8) | (lo as u16)
@@ -76,5 +101,9 @@ impl Memory {
     pub fn mass_write(&mut self, start_addr: u16, bytes: &Vec<u8>) {
         self.memory[start_addr as usize..(start_addr as usize + bytes.len())]
             .copy_from_slice(&bytes[..])
+    }
+
+    pub fn poll_nmi(&mut self) -> Option<u8> {
+        self.ppu.poll_nmi()
     }
 }
