@@ -1,22 +1,19 @@
 use cartridge::Cartridge;
 use ppu::Ppu;
-use rand::Rng;
 use render::frame::Frame;
 use sdl2::{
-    event::{Event, self},
+    event::Event,
     keyboard::Keycode,
     pixels::{Color, PixelFormatEnum},
-    render::Texture,
-    EventPump,
 };
-use std::{env, collections::HashMap, fs, path::Path};
-mod cpu;
-mod memory;
+use std::{collections::HashMap, env};
 mod cartridge;
+mod cpu;
+mod joypad;
+mod memory;
 mod opcodes;
 mod ppu;
 mod render;
-mod joypad;
 
 #[macro_use]
 extern crate lazy_static;
@@ -94,13 +91,6 @@ fn color(byte: u8) -> Color {
 
 fn main() {
     env::set_var("RUST_BACKTRACE", "1");
-    // This will eventually use file path as input
-    // let args: Vec<String> = env::args().collect();
-    // let file_path = &args[1];
-
-    //let path = Path::new("./games/Super Mario Bros. (World).nes");
-
-    //let bytes = fs::read(path).expect("Cannot read path");
 
     let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
@@ -150,19 +140,18 @@ fn main() {
     let cartridge = Cartridge::new(&bytes).unwrap();
 
     let mut key_map = HashMap::new();
-   key_map.insert(Keycode::Down, joypad::JoypadButton::DOWN);
-   key_map.insert(Keycode::Up, joypad::JoypadButton::UP);
-   key_map.insert(Keycode::Right, joypad::JoypadButton::RIGHT);
-   key_map.insert(Keycode::Left, joypad::JoypadButton::LEFT);
-   key_map.insert(Keycode::Space, joypad::JoypadButton::SELECT);
-   key_map.insert(Keycode::Return, joypad::JoypadButton::START);
-   key_map.insert(Keycode::A, joypad::JoypadButton::BUTTON_A);
-   key_map.insert(Keycode::S, joypad::JoypadButton::BUTTON_B);
+    key_map.insert(Keycode::Down, joypad::JoypadButton::DOWN);
+    key_map.insert(Keycode::Up, joypad::JoypadButton::UP);
+    key_map.insert(Keycode::Right, joypad::JoypadButton::RIGHT);
+    key_map.insert(Keycode::Left, joypad::JoypadButton::LEFT);
+    key_map.insert(Keycode::Space, joypad::JoypadButton::SELECT);
+    key_map.insert(Keycode::Return, joypad::JoypadButton::START);
+    key_map.insert(Keycode::A, joypad::JoypadButton::BUTTON_A);
+    key_map.insert(Keycode::S, joypad::JoypadButton::BUTTON_B);
 
     let mut frame = Frame::new();
 
-
-    let mut cpu = cpu::Cpu::new(cartridge, move |ppu: &Ppu, joypad: &mut joypad::Joypad|  {
+    let mut cpu = cpu::Cpu::new(cartridge, move |ppu: &Ppu, joypad: &mut joypad::Joypad| {
         render::render(ppu, &mut frame);
         texture.update(None, &frame.data, 256 * 3).unwrap();
 
@@ -170,7 +159,11 @@ fn main() {
         canvas.present();
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit { .. } | Event::KeyDown { keycode: Some(Keycode::Escape), ..} => ::std::process::exit(0),
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => ::std::process::exit(0),
                 Event::KeyDown { keycode, .. } => {
                     if let Some(key) = key_map.get(&keycode.unwrap_or(Keycode::Ampersand)) {
                         joypad.set_button_pressed_status(*key, true);
@@ -186,19 +179,6 @@ fn main() {
         }
     });
     cpu.reset();
-    // cpu.set_pc(0xC000);
 
-    cpu.run_with_callback(move |cpu| {
-        // println!("{}", cpu::test::trace(cpu));
-        // handle_user_input(cpu, &mut event_pump);
-        // cpu.memory.write(0xfe, rng.gen_range(1, 16));
-
-        // if read_screen_state(cpu, &mut screen_state) {
-        //     texture.update(None, &screen_state, 32 * 3).unwrap();
-        //     canvas.copy(&texture, None, None).unwrap();
-        //     canvas.present();
-        // }
-
-        // ::std::thread::sleep(std::time::Duration::new(0, 70000))
-    })
+    cpu.run_with_callback(move |cpu| {})
 }

@@ -133,8 +133,8 @@ lazy_static! {
 
         /* Branching */
 
-        OpCode::new(0x4c, "JMP", 3, 3, AddrModes::Immd), 
-        OpCode::new(0x6c, "JMP", 3, 5, AddrModes::Indr), 
+        OpCode::new(0x4c, "JMP", 3, 3, AddrModes::Immd),
+        OpCode::new(0x6c, "JMP", 3, 5, AddrModes::Indr),
 
         OpCode::new(0x20, "JSR", 3, 6, AddrModes::Abs),
         OpCode::new(0x60, "RTS", 1, 6, AddrModes::NoneAddr),

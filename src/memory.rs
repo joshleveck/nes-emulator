@@ -1,4 +1,4 @@
-use crate::{ppu::Ppu, joypad::Joypad};
+use crate::{joypad::Joypad, ppu::Ppu};
 
 use super::cartridge::Cartridge;
 
@@ -8,7 +8,7 @@ pub struct Memory<'call> {
     ppu: Ppu,
     joypad: Joypad,
     cycles: usize,
-    gameloop_callback : Box<dyn FnMut(&Ppu, &mut Joypad) + 'call>,
+    gameloop_callback: Box<dyn FnMut(&Ppu, &mut Joypad) + 'call>,
 }
 
 const RAM: u16 = 0x0000;
@@ -93,9 +93,9 @@ impl<'a> Memory<'a> {
             0x2005 => self.ppu.write_to_scroll(data),
             0x2006 => self.ppu.write_to_ppu_addr(data),
             0x2007 => self.ppu.write_to_data(data),
-            0x4014 => {},
+            0x4014 => {}
             0x4016 => self.joypad.write(data),
-            0x4017 => {},
+            0x4017 => {}
             0x2008..=PPU_REGISTERS_MIRRORS_END => {
                 let _mirror_down_addr = addr & 0b00100000_00000111;
                 self.write(_mirror_down_addr, data)

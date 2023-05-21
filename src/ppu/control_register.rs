@@ -86,18 +86,6 @@ impl ControlRegister {
         }
     }
 
-    pub fn sprite_size(&self) -> u8 {
-        if self.sprite_size {
-            16
-        } else {
-            8
-        }
-    }
-
-    pub fn master_slave_select(&self) -> u8 {
-        self.master_slave as u8
-    }
-
     pub fn generate_vblank_nmi(&self) -> bool {
         self.nmi
     }
@@ -112,6 +100,4 @@ impl ControlRegister {
         self.master_slave = data & 0b1000000 != 0;
         self.nmi = data & 0b10000000 != 0;
     }
-
-    
 }

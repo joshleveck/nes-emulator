@@ -14,7 +14,6 @@ bitflags! {
     }
 }
 
-
 pub struct Joypad {
     pub button: JoypadButton,
     pub strobe: bool,
@@ -30,7 +29,7 @@ impl Joypad {
         }
     }
 
-    pub fn write(&mut self, data:u8) {
+    pub fn write(&mut self, data: u8) {
         self.strobe = data & 1 == 1;
         if self.strobe {
             self.index = 0;

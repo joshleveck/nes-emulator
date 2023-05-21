@@ -1,4 +1,4 @@
-use crate::{cartridge::Cartridge, opcodes::OPCODES_MAP, ppu::Ppu, joypad::Joypad};
+use crate::{cartridge::Cartridge, joypad::Joypad, opcodes::OPCODES_MAP, ppu::Ppu};
 
 use super::memory;
 
@@ -106,9 +106,10 @@ pub struct Cpu<'call> {
 }
 
 impl<'a> Cpu<'a> {
-    pub fn new<'call, F>(cartridge: Cartridge, mem_callback: F) -> Cpu<'call> 
-    where 
-        F: FnMut(&Ppu, &mut Joypad) + 'call {
+    pub fn new<'call, F>(cartridge: Cartridge, mem_callback: F) -> Cpu<'call>
+    where
+        F: FnMut(&Ppu, &mut Joypad) + 'call,
+    {
         return Cpu {
             a: 0,
             x: 0,

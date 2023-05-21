@@ -1,7 +1,7 @@
 pub mod frame;
 pub mod palette;
 
-use crate::{ppu::Ppu, cartridge::Mirroring};
+use crate::{cartridge::Mirroring, ppu::Ppu};
 use frame::Frame;
 
 struct Rect {
@@ -48,23 +48,29 @@ fn sprite_palette(ppu: &Ppu, pallete_idx: u8) -> [u8; 4] {
     ]
 }
 
-fn render_name_table(ppu: &Ppu, frame: &mut Frame, name_table: &[u8],
-    view_port: Rect, shift_x: isize, shift_y: isize) {
+fn render_name_table(
+    ppu: &Ppu,
+    frame: &mut Frame,
+    name_table: &[u8],
+    view_port: Rect,
+    shift_x: isize,
+    shift_y: isize,
+) {
     let bank = ppu.ctrl_bknd();
- 
-    let attribute_table = &name_table[0x3c0.. 0x400];
- 
+
+    let attribute_table = &name_table[0x3c0..0x400];
+
     for i in 0..0x3c0 {
         let tile_column = i % 32;
         let tile_row = i / 32;
         let tile_idx = name_table[i] as u16;
         let tile = &ppu.get_chr_rom(bank + tile_idx * 16, bank + tile_idx * 16 + 15);
         let palette = bg_palette(ppu, attribute_table, tile_column, tile_row);
- 
+
         for y in 0..=7 {
             let mut upper = tile[y];
             let mut lower = tile[y + 8];
- 
+
             for x in (0..=7).rev() {
                 let value = (1 & lower) << 1 | (1 & upper);
                 upper = upper >> 1;
@@ -78,48 +84,71 @@ fn render_name_table(ppu: &Ppu, frame: &mut Frame, name_table: &[u8],
                 };
                 let pixel_x = tile_column * 8 + x;
                 let pixel_y = tile_row * 8 + y;
- 
-                if pixel_x >= view_port.x1 && pixel_x < view_port.x2 && pixel_y >= view_port.y1 && pixel_y < view_port.y2 {
-                    frame.set_pixel((shift_x + pixel_x as isize) as usize, (shift_y + pixel_y as isize) as usize, rgb);
+
+                if pixel_x >= view_port.x1
+                    && pixel_x < view_port.x2
+                    && pixel_y >= view_port.y1
+                    && pixel_y < view_port.y2
+                {
+                    frame.set_pixel(
+                        (shift_x + pixel_x as isize) as usize,
+                        (shift_y + pixel_y as isize) as usize,
+                        rgb,
+                    );
                 }
             }
         }
     }
- }
- 
+}
 
 pub fn render(ppu: &Ppu, frame: &mut Frame) {
     let scroll_x = (ppu.get_scroll().x) as usize;
     let scroll_y = (ppu.get_scroll().y) as usize;
 
-    let (main_nametable, second_nametable) = match (&ppu.get_mirroring(), ppu.get_ctrl_nametable()) {
-        (Mirroring::Vertical, 0x2000) | (Mirroring::Vertical, 0x2800) | (Mirroring::Horizontal, 0x2000) | (Mirroring::Horizontal, 0x2400) => {
+    let (main_nametable, second_nametable) = match (&ppu.get_mirroring(), ppu.get_ctrl_nametable())
+    {
+        (Mirroring::Vertical, 0x2000)
+        | (Mirroring::Vertical, 0x2800)
+        | (Mirroring::Horizontal, 0x2000)
+        | (Mirroring::Horizontal, 0x2400) => {
             (ppu.get_vram_span(0, 0x400), ppu.get_vram_span(0x400, 0x800))
         }
-        (Mirroring::Vertical, 0x2400) | (Mirroring::Vertical, 0x2C00) | (Mirroring::Horizontal, 0x2800) | (Mirroring::Horizontal, 0x2C00) => {
+        (Mirroring::Vertical, 0x2400)
+        | (Mirroring::Vertical, 0x2C00)
+        | (Mirroring::Horizontal, 0x2800)
+        | (Mirroring::Horizontal, 0x2C00) => {
             (ppu.get_vram_span(0x400, 0x800), ppu.get_vram_span(0, 0x400))
         }
-        (_,_) => {
+        (_, _) => {
             panic!("Not supported mirroring type {:?}", ppu.get_mirroring());
         }
     };
 
-    render_name_table(ppu, frame, 
-        main_nametable, 
-        Rect::new(scroll_x, scroll_y, 256, 240 ),
-        -(scroll_x as isize), -(scroll_y as isize)
+    render_name_table(
+        ppu,
+        frame,
+        main_nametable,
+        Rect::new(scroll_x, scroll_y, 256, 240),
+        -(scroll_x as isize),
+        -(scroll_y as isize),
     );
     if scroll_x > 0 {
-        render_name_table(ppu, frame, 
-            second_nametable, 
+        render_name_table(
+            ppu,
+            frame,
+            second_nametable,
             Rect::new(0, 0, scroll_x, 240),
-            (256 - scroll_x) as isize, 0
+            (256 - scroll_x) as isize,
+            0,
         );
     } else if scroll_y > 0 {
-        render_name_table(ppu, frame, 
-            second_nametable, 
+        render_name_table(
+            ppu,
+            frame,
+            second_nametable,
             Rect::new(0, 0, 256, scroll_y),
-            0, (240 - scroll_y) as isize
+            0,
+            (240 - scroll_y) as isize,
         );
     }
 

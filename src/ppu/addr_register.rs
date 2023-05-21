@@ -4,7 +4,6 @@ pub struct AddrRegister {
     hi_ptr: bool,
 }
 
-
 impl AddrRegister {
     pub fn new() -> Self {
         AddrRegister {
