@@ -1,3 +1,5 @@
 /target
 /games
+/logs
 .env
+SDL2.dll
