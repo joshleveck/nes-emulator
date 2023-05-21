@@ -58,8 +58,13 @@ impl Ppu {
     }
 
     pub fn tick(&mut self, cycles: u8) -> bool {
+        // println!("TICK {}", cycles);
         self.cycles += cycles as usize;
         if self.cycles >= 341 {
+            if self.is_sprite_0_hit(self.cycles) {
+                self.status.sprite_zero_hit = true;
+            }
+
             self.cycles -= 341;
             self.scanline += 1;
 
@@ -74,12 +79,19 @@ impl Ppu {
             if self.scanline >= 262 {
                 self.scanline = 0;
                 self.nmi_interrupt = None;
+                self.status.sprite_zero_hit = false;
                 self.status.vblank = false;
                 return true;
             }
         }
 
         return false;
+    }
+
+    fn is_sprite_0_hit(&self, cycle: usize) -> bool {
+        let y = self.oam_data[0] as usize;
+        let x = self.oam_data[3] as usize;
+        (y == self.scanline as usize) && x <= cycle && self.mask.show_sprites
     }
 
     pub fn poll_nmi(&mut self) -> Option<u8> {
@@ -135,6 +147,50 @@ impl Ppu {
 
     pub fn read_oam_data(&self) -> u8 {
         self.oam_data[self.oam_addr as usize]
+    }
+
+    pub fn ctrl_bknd(&self) -> u16 {
+        self.ctrl.bknd_pattern_addr()
+    }
+
+    pub fn ctrl_sptr(&self) -> u16 {
+        self.ctrl.sprt_patter_addr()
+    }
+
+    pub fn get_vram(&self, addr: usize) -> u8 {
+        self.vram[addr as usize]
+    }
+
+    pub fn get_chr_rom(&self, start: u16, end: u16) -> &[u8] {
+        &self.chr_rom[start as usize..=end as usize]
+    }
+
+    pub fn get_nmi(&self) -> Option<u8> {
+        self.nmi_interrupt
+    }
+
+    pub fn get_palette_table(&self, addr: usize) -> u8 {
+        self.palette_table[addr]
+    }
+
+    pub fn get_oam_data(&self) -> &[u8] {
+        &self.oam_data
+    }
+
+    pub fn get_mirroring(&self) -> &Mirroring {
+        &self.mirroring
+    }
+
+    pub fn get_scroll(&self) -> &ScrollRegister {
+        &self.scroll
+    }
+
+    pub fn get_vram_span(&self, start: u16, end: u16) -> &[u8] {
+        &self.vram[start as usize..end as usize]
+    }
+
+    pub fn get_ctrl_nametable(&self) -> u16 {
+        self.ctrl.nametable_addr()
     }
 
     fn increment_vram_addr(&mut self) {

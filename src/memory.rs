@@ -1,12 +1,14 @@
-use crate::ppu::Ppu;
+use crate::{ppu::Ppu, joypad::Joypad};
 
 use super::cartridge::Cartridge;
 
-pub struct Memory {
-    memory: [u8; 2048],
+pub struct Memory<'call> {
+    pub memory: [u8; 2048],
     cartridge: Cartridge,
     ppu: Ppu,
+    joypad: Joypad,
     cycles: usize,
+    gameloop_callback : Box<dyn FnMut(&Ppu, &mut Joypad) + 'call>,
 }
 
 const RAM: u16 = 0x0000;
@@ -14,21 +16,32 @@ const RAM_MIRRORS_END: u16 = 0x1FFF;
 const PPU_REGISTERS: u16 = 0x2000;
 const PPU_REGISTERS_MIRRORS_END: u16 = 0x3FFF;
 
-impl Memory {
-    pub fn new(cartridge: Cartridge) -> Self {
+impl<'a> Memory<'a> {
+    pub fn new<'call, F>(cartridge: Cartridge, gameloop_callback: F) -> Memory<'call>
+    where
+        F: FnMut(&Ppu, &mut Joypad) + 'call,
+    {
         let chr_rom = cartridge.chr_rom.clone();
         let mirroring = cartridge.mirroring.clone();
         return Memory {
             memory: [0; 2048],
             cartridge,
             ppu: Ppu::new(chr_rom, mirroring),
+            joypad: Joypad::new(),
             cycles: 0,
+            gameloop_callback: Box::new(gameloop_callback),
         };
     }
 
     pub fn tick(&mut self, cycles: u8) {
         self.cycles += cycles as usize;
+        let nmi_bef = self.ppu.get_nmi().is_some();
         self.ppu.tick(cycles * 3);
+        let nmi_after = self.ppu.get_nmi().is_some();
+
+        if !nmi_bef && nmi_after {
+            (self.gameloop_callback)(&self.ppu, &mut self.joypad);
+        }
     }
 
     pub fn read(&mut self, addr: u16) -> u8 {
@@ -38,9 +51,15 @@ impl Memory {
                 self.memory[mirror_down_addr as usize]
             }
             0x2000 | 0x2001 | 0x2003 | 0x2005 | 0x2006 | 0x4014 => {
-                panic!("Attempted to read from write only PPU register {:X}", addr)
+                // panic!("Attempted to read from write only PPU register {:X}", addr)
+                0
             }
+            0x2002 => self.ppu.read_status(),
+            0x2004 => self.ppu.read_oam_data(),
             0x2007 => self.ppu.read_data(),
+            0x4010 => 0,
+            0x4016 => self.joypad.read(),
+            0x4017 => 0,
             0x2008..=PPU_REGISTERS_MIRRORS_END => {
                 let _mirror_down_addr = addr & 0b00100000_00000111;
                 self.read(_mirror_down_addr)
@@ -54,7 +73,7 @@ impl Memory {
                 self.cartridge.prg_rom[addr as usize]
             }
             _ => {
-                println!("Ignoring memory access {}", addr);
+                println!("Ignoring memory access {:X}", addr);
                 0
             }
         }
@@ -74,15 +93,18 @@ impl Memory {
             0x2005 => self.ppu.write_to_scroll(data),
             0x2006 => self.ppu.write_to_ppu_addr(data),
             0x2007 => self.ppu.write_to_data(data),
+            0x4014 => {},
+            0x4016 => self.joypad.write(data),
+            0x4017 => {},
             0x2008..=PPU_REGISTERS_MIRRORS_END => {
                 let _mirror_down_addr = addr & 0b00100000_00000111;
                 self.write(_mirror_down_addr, data)
             }
             0x8000..=0xFFFF => {
-                panic!("Cannot write to Cartridge")
+                panic!("Cannot write to Cartridge {:X}", addr)
             }
             _ => {
-                println!("Ignoring memory access {}", addr);
+                println!("Ignoring memory access {:X}", addr);
             }
         }
     }

@@ -1,8 +1,6 @@
 use crate::cpu::AddrModes;
 use std::collections::HashMap;
 
-
-
 pub struct OpCode {
     pub code: u8,
     pub mnemonic: &'static str,

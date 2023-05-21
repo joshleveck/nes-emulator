@@ -1,4 +1,4 @@
-use crate::{cartridge::Cartridge, opcodes::OPCODES_MAP};
+use crate::{cartridge::Cartridge, opcodes::OPCODES_MAP, ppu::Ppu, joypad::Joypad};
 
 use super::memory;
 
@@ -95,26 +95,28 @@ impl Status {
     }
 }
 
-pub struct Cpu {
+pub struct Cpu<'call> {
     a: u8,
     x: u8,
     y: u8,
     pc: u16,
     sp: u8,
     p: Status,
-    pub memory: memory::Memory,
+    pub memory: memory::Memory<'call>,
 }
 
-impl Cpu {
-    pub fn new(cartridge: Cartridge) -> Self {
-        return Self {
+impl<'a> Cpu<'a> {
+    pub fn new<'call, F>(cartridge: Cartridge, mem_callback: F) -> Cpu<'call> 
+    where 
+        F: FnMut(&Ppu, &mut Joypad) + 'call {
+        return Cpu {
             a: 0,
             x: 0,
             y: 0,
             pc: 0x8000,
             sp: STACK_INIT,
             p: Status::new(),
-            memory: memory::Memory::new(cartridge),
+            memory: memory::Memory::new(cartridge, mem_callback),
         };
     }
 
@@ -248,10 +250,7 @@ impl Cpu {
     fn branch(&mut self, cond: bool) {
         if cond {
             self.memory.tick(1);
-
-            let jump: i8 = self.memory.read(self.pc) as i8;
-            let jump_addr = self.pc.wrapping_add(jump as u16);
-            self.pc = jump_addr;
+            self.pc = self.get_operand_address(&AddrModes::Rel).0;
         } else {
             self.pc += 1;
         }

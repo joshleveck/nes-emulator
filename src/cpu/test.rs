@@ -1,7 +1,9 @@
 #[cfg(test)]
 use crate::cartridge::test::test_cartridge;
 use crate::cpu::{AddrModes, Cpu};
+use crate::joypad::Joypad;
 use crate::opcodes::OPCODES_MAP;
+use crate::ppu::Ppu;
 
 pub fn trace(cpu: &mut Cpu) -> String {
     let org_pc = cpu.pc;
@@ -31,7 +33,7 @@ pub fn trace(cpu: &mut Cpu) -> String {
             _ => String::from(""),
         },
         2 => {
-            let val = cpu.memory.read(cpu.pc + 1);
+            let val = cpu.memory.memory[(cpu.pc + 1) as usize];
             hex.push(val);
 
             match opcode.mode {
@@ -132,7 +134,7 @@ pub fn trace(cpu: &mut Cpu) -> String {
 
 #[test]
 fn test_format_trace() {
-    let mut cpu = Cpu::new(test_cartridge());
+    let mut cpu = Cpu::new(test_cartridge(), move |_: &Ppu, _: &mut Joypad| {});
     cpu.memory.write(100, 0xa2);
     cpu.memory.write(101, 0x01);
     cpu.memory.write(102, 0xca);
@@ -164,7 +166,7 @@ fn test_format_trace() {
 
 #[test]
 fn test_format_mem_access() {
-    let mut cpu = Cpu::new(test_cartridge());
+    let mut cpu = Cpu::new(test_cartridge(), move |_: &Ppu, _: &mut Joypad| {});
 
     // ORA ($33), Y
     cpu.memory.write(100, 0x11);
