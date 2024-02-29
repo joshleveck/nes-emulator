@@ -1,97 +1,156 @@
-const NES_TAG: [u8; 4] = [0x4E, 0x45, 0x53, 0x1A];
-const PRG_ROM_PAGE_SIZE: usize = 16384;
-const CHR_ROM_PAGE_SIZE: usize = 8192;
+mod cartridge_data;
+mod cartridge_header;
+mod mapper;
+mod mapper0;
+mod mapper1;
+mod mapper2;
+mod mapper3;
+mod mapper4;
+mod pager;
 
-#[derive(Debug, PartialEq, Clone)]
+use self::cartridge_data::CartridgeData;
+use self::mapper::Mapper;
+use self::mapper0::Mapper0;
+use self::mapper1::Mapper1;
+use self::mapper2::Mapper2;
+use self::mapper3::Mapper3;
+use self::mapper4::Mapper4;
+
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Mirroring {
-    Horizontal,
     Vertical,
-    FourScreen,
+    Horizontal,
+    None,
 }
 
 pub struct Cartridge {
-    pub prg_rom: Vec<u8>,
-    pub chr_rom: Vec<u8>,
-    pub mapper: u8,
-    pub mirroring: Mirroring,
+    mapper: Box<dyn Mapper>,
 }
 
 impl Cartridge {
-    pub fn new(raw: &Vec<u8>) -> Result<Cartridge, String> {
-        if &raw[0..4] != NES_TAG {
-            return Err("Invalid NES file".to_string());
-        }
+    pub fn new(data: &[u8]) -> Self {
+        let data = CartridgeData::new(data);
 
-        let mapper = (raw[7] & 0b1111_0000) | (raw[6] >> 4);
-
-        let ines_ver = (raw[7] >> 2) & 0b11;
-        if ines_ver != 0 {
-            return Err(format!("Unsupported iNES version {}", ines_ver));
-        }
-
-        let mirroring = if raw[6] & 0b1000 != 0 {
-            Mirroring::FourScreen
-        } else if raw[6] & 0b1 == 0 {
-            Mirroring::Horizontal
-        } else {
-            Mirroring::Vertical
+        let mapper: Box<dyn Mapper> = match data.header.mapper_number {
+            0 => Box::new(Mapper0::new(data)),
+            1 => Box::new(Mapper1::new(data)),
+            2 => Box::new(Mapper2::new(data)),
+            3 => Box::new(Mapper3::new(data)),
+            4 => Box::new(Mapper4::new(data)),
+            n => panic!("Mapper {} not implemented", n),
         };
 
-        let prg_rom_size = raw[4] as usize * PRG_ROM_PAGE_SIZE;
-        let chr_rom_size = raw[5] as usize * CHR_ROM_PAGE_SIZE;
+        Cartridge { mapper: mapper }
+    }
 
-        let skip_trainer = raw[6] & 0b100 != 0;
+    pub fn signal_scanline(&mut self) {
+        self.mapper.signal_scanline();
+    }
 
-        let prg_rom_start = 16 + if skip_trainer { 512 } else { 0 };
-        let chr_rom_start = prg_rom_start + prg_rom_size;
+    pub fn read_prg_byte(&self, address: u16) -> u8 {
+        self.mapper.read_prg_byte(address)
+    }
 
-        Ok(Cartridge {
-            prg_rom: raw[prg_rom_start..(prg_rom_start + prg_rom_size)].to_vec(),
-            chr_rom: raw[chr_rom_start..(chr_rom_start + chr_rom_size)].to_vec(),
-            mapper,
-            mirroring,
-        })
+    pub fn write_prg_byte(&mut self, address: u16, value: u8) {
+        self.mapper.write_prg_byte(address, value);
+    }
+
+    pub fn read_chr_byte(&self, address: u16) -> u8 {
+        self.mapper.read_chr_byte(address)
+    }
+
+    pub fn write_chr_byte(&mut self, address: u16, value: u8) {
+        self.mapper.write_chr_byte(address, value)
+    }
+
+    pub fn mirroring(&self) -> Mirroring {
+        self.mapper.mirroring()
+    }
+
+    pub fn irq_flag(&self) -> bool {
+        self.mapper.irq_flag()
     }
 }
 
 #[cfg(test)]
-pub mod test {
+mod ppu_test {
     use super::*;
-    struct TestRom {
-        header: Vec<u8>,
-        trainer: Option<Vec<u8>>,
-        pgp_rom: Vec<u8>,
-        chr_rom: Vec<u8>,
-    }
+    fn build_cartridge(chr_ram: bool) -> Cartridge {
+        let mut data = vec![
+            0x4e,
+            0x45,
+            0x53,
+            0x1a,
+            0x02,                        // Two pages of PRG-ROM
+            if chr_ram { 0 } else { 1 }, // One page of CHR-ROM
+            0x00,
+            0x00,
+            0x01, // One page of PRG-RAM
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
 
-    fn create_rom(rom: TestRom) -> Vec<u8> {
-        let mut result = Vec::with_capacity(
-            rom.header.len()
-                + rom.trainer.as_ref().map_or(0, |t| t.len())
-                + rom.pgp_rom.len()
-                + rom.chr_rom.len(),
-        );
-
-        result.extend(&rom.header);
-        if let Some(t) = rom.trainer {
-            result.extend(t);
+        // add the PRG-ROM
+        for i in 0..0x8000u16 / 2 {
+            data.push((i >> 8) as u8);
+            data.push(i as u8);
         }
-        result.extend(&rom.pgp_rom);
-        result.extend(&rom.chr_rom);
 
-        result
+        if !chr_ram {
+            // add the CHR-ROM
+            for i in 0..0x2000u16 / 2 {
+                data.push((i >> 8) as u8);
+                data.push(i as u8);
+            }
+        }
+
+        Cartridge::new(&data)
     }
 
-    pub fn test_cartridge() -> Cartridge {
-        let test_rom = create_rom(TestRom {
-            header: vec![
-                0x4E, 0x45, 0x53, 0x1A, 0x02, 0x01, 0x31, 00, 00, 00, 00, 00, 00, 00, 00, 00,
-            ],
-            trainer: None,
-            pgp_rom: vec![1; 2 * PRG_ROM_PAGE_SIZE],
-            chr_rom: vec![2; 1 * CHR_ROM_PAGE_SIZE],
-        });
+    #[test]
+    fn test_read_prg_rom() {
+        let cartridge = build_cartridge(false);
+        for i in 0..0x8000u16 {
+            if i % 2 == 0 {
+                assert_eq!(cartridge.read_prg_byte(0x8000 + i), ((i / 2) >> 8) as u8);
+            } else {
+                assert_eq!(cartridge.read_prg_byte(0x8000 + i), (i / 2) as u8);
+            }
+        }
+    }
 
-        Cartridge::new(&test_rom).unwrap()
+    #[test]
+    fn test_prg_ram() {
+        let mut cartridge = build_cartridge(false);
+        for i in 0x6000u16..0x7000u16 {
+            cartridge.write_prg_byte(i, i as u8);
+            assert_eq!(cartridge.read_prg_byte(i), i as u8);
+        }
+    }
+
+    #[test]
+    fn test_read_chr_rom() {
+        let cartridge = build_cartridge(false);
+        for i in 0..0x2000u16 {
+            if i % 2 == 0 {
+                assert_eq!(cartridge.read_chr_byte(i), ((i / 2) >> 8) as u8);
+            } else {
+                assert_eq!(cartridge.read_chr_byte(i), (i / 2) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn test_chr_ram() {
+        let mut cartridge = build_cartridge(true);
+        for i in 0..0x2000u16 {
+            cartridge.write_chr_byte(i, i as u8);
+            assert_eq!(cartridge.read_chr_byte(i), i as u8);
+        }
     }
 }

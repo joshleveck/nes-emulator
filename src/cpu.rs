@@ -1,835 +1,1202 @@
-use crate::{cartridge::Cartridge, joypad::Joypad, opcodes::OPCODES_MAP, ppu::Ppu};
+use crate::bus::Bus;
+use std::fmt::Write;
 
-use super::memory;
+use crate::cpu_debug::{INSTRUCTION_NAMES, INSTRUCTION_SIZES};
 
-pub mod test;
-
-const STACK_INIT: u8 = 0xfd;
-const STACK: u16 = 0x0100;
-const STATUS_INIT: u8 = 0x24;
-
-#[derive(Debug, PartialEq)]
-pub enum AddrModes {
-    Immd,
-    ZeroP,
-    ZeroPX,
-    ZeroPY,
-    Rel,
-    Abs,
-    AbsX,
-    AbsY,
-    Indr,
-    IndrX,
-    IndrY,
-    NoneAddr,
+#[cfg_attr(rustfmt, rustfmt_skip)]
+enum Flag {
+    Carry      = 0b00000001,
+    Zero       = 0b00000010,
+    IrqDisable = 0b00000100,
+    Decimal    = 0b00001000,
+    Break      = 0b00010000,
+    Push       = 0b00100000,
+    Overflow   = 0b01000000,
+    Negative   = 0b10000000,
 }
 
-pub struct Status {
-    carry: bool,
-    zero: bool,
-    intr_d: bool,
-    dec: bool,
-    brk: bool,
-    brk2: bool,
-    ovflw: bool,
-    neg: bool,
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum Mode {
+    Immediate,
+    ZeroPage,
+    ZeroPageX,
+    ZeroPageY,
+    Absolute,
+    AbsoluteX,
+    AbsoluteXForceTick,
+    AbsoluteYForceTick,
+    AbsoluteY,
+    Indirect,
+    IndirectX,
+    IndirectY,
+    IndirectYForceTick,
+    NoMode,
 }
 
-impl Status {
-    fn new() -> Self {
-        Status {
-            carry: false,
-            zero: false,
-            intr_d: true,
-            dec: false,
-            brk: false,
-            brk2: true,
-            ovflw: false,
-            neg: false,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.from_data(STATUS_INIT);
-    }
-
-    fn to_data(&self) -> u8 {
-        let mut res: u8 = 0;
-        if self.neg {
-            res |= 1 << 7;
-        }
-        if self.ovflw {
-            res |= 1 << 6;
-        }
-        if self.brk2 {
-            res |= 1 << 5;
-        }
-        if self.brk {
-            res |= 1 << 4;
-        }
-        if self.dec {
-            res |= 1 << 3;
-        }
-        if self.intr_d {
-            res |= 1 << 2;
-        }
-        if self.zero {
-            res |= 1 << 1;
-        }
-        if self.carry {
-            res |= 1;
-        }
-
-        res
-    }
-
-    fn from_data(&mut self, data: u8) {
-        self.carry = data & 1 != 0;
-        self.zero = data & (1 << 1) != 0;
-        self.intr_d = data & (1 << 2) != 0;
-        self.dec = data & (1 << 3) != 0;
-        self.brk = data & (1 << 4) != 0;
-        self.brk2 = data & (1 << 5) != 0;
-        self.ovflw = data & (1 << 6) != 0;
-        self.neg = data & (1 << 7) != 0;
-    }
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum Interrupt {
+    Nmi,
+    Reset,
+    Irq,
+    Break,
 }
 
-pub struct Cpu<'call> {
+pub struct Cpu {
+    pub bus: Bus,
+    pc: u16,
+    sp: u8,
     a: u8,
     x: u8,
     y: u8,
-    pc: u16,
-    sp: u8,
-    p: Status,
-    pub memory: memory::Memory<'call>,
+    p: u8,
 }
 
-impl<'a> Cpu<'a> {
-    pub fn new<'call, F>(cartridge: Cartridge, mem_callback: F) -> Cpu<'call>
-    where
-        F: FnMut(&Ppu, &mut Joypad) + 'call,
-    {
-        return Cpu {
+impl Cpu {
+    pub fn new(bus: Bus) -> Self {
+        Cpu {
+            bus,
+            pc: 0,
+            sp: 0,
             a: 0,
             x: 0,
             y: 0,
-            pc: 0x8000,
-            sp: STACK_INIT,
-            p: Status::new(),
-            memory: memory::Memory::new(cartridge, mem_callback),
-        };
-    }
-
-    fn stack_push(&mut self, data: u8) {
-        self.memory.write(STACK + self.sp as u16, data);
-        self.sp -= 1;
-    }
-
-    fn stack_push_u16(&mut self, data: u16) {
-        let hi = (data >> 8) as u8;
-        let low = (data & 0xff) as u8;
-
-        self.stack_push(hi);
-        self.stack_push(low);
-    }
-
-    fn stack_pop(&mut self) -> u8 {
-        self.sp += 1;
-        self.memory.read(STACK + self.sp as u16)
-    }
-
-    fn stack_pop_u16(&mut self) -> u16 {
-        let low = self.stack_pop() as u16;
-        let hi = self.stack_pop() as u16;
-
-        hi << 8 | low
-    }
-
-    fn update_z_n(&mut self, result: u8) {
-        self.p.zero = result == 0;
-        self.p.neg = result & (1 << 7) != 0
-    }
-
-    fn page_cross(&self, addr1: u16, addr2: u16) -> bool {
-        addr1 & 0xFF00 != addr2 & 0xFF00
-    }
-
-    fn get_operand_address(&mut self, mode: &AddrModes) -> (u16, bool) {
-        match mode {
-            // Encoded in the instruction
-            AddrModes::Immd => {
-                self.pc += 1;
-                (self.pc - 1, false)
-            }
-            // Zero page is addresses 00-FF (1 byte)
-            // Encoded in the instruction
-            AddrModes::ZeroP => {
-                self.pc += 1;
-                (self.memory.read(self.pc - 1) as u16, false)
-            }
-            AddrModes::ZeroPX => {
-                let param = self.memory.read(self.pc);
-                self.pc += 1;
-                // Specs allow overflow
-                let addr = param.wrapping_add(self.x) as u16;
-                (addr, false)
-            }
-            AddrModes::ZeroPY => {
-                let param = self.memory.read(self.pc);
-                self.pc += 1;
-                // Specs allow overflow
-                let addr = param.wrapping_add(self.y) as u16;
-                (addr, false)
-            }
-            AddrModes::Rel => {
-                let param = self.memory.read(self.pc) as i8;
-
-                (self.pc.wrapping_add(1).wrapping_add(param as u16), false)
-            }
-            AddrModes::Abs => {
-                let param = self.memory.read_u16(self.pc);
-                self.pc += 2;
-                (param, false)
-            }
-            AddrModes::AbsX => {
-                let param = self.memory.read_u16(self.pc);
-                let addr = param.wrapping_add(self.x as u16);
-                self.pc += 2;
-                (addr, self.page_cross(param, addr))
-            }
-            AddrModes::AbsY => {
-                let param = self.memory.read_u16(self.pc);
-                let addr = param.wrapping_add(self.y as u16);
-                self.pc += 2;
-                (addr, self.page_cross(param, addr))
-            }
-            AddrModes::Indr => {
-                let param = self.memory.read_u16(self.pc);
-                self.pc += 2;
-                (self.memory.read_u16(param), false)
-            }
-            AddrModes::IndrX => {
-                let base = self.memory.read(self.pc);
-                self.pc += 1;
-
-                let ptr: u8 = (base as u8).wrapping_add(self.x);
-                let lo = self.memory.read(ptr as u16);
-                let hi = self.memory.read(ptr.wrapping_add(1) as u16);
-                ((hi as u16) << 8 | (lo as u16), false)
-            }
-            AddrModes::IndrY => {
-                let base = self.memory.read(self.pc);
-                self.pc += 1;
-
-                let lo = self.memory.read(base as u16);
-                let hi = self.memory.read((base as u8).wrapping_add(1) as u16);
-                let deref_base = (hi as u16) << 8 | (lo as u16);
-                let deref = deref_base.wrapping_add(self.y as u16);
-
-                (deref, self.page_cross(deref_base, deref))
-            }
-            AddrModes::NoneAddr => panic!("No address mode"),
+            p: 0,
         }
-    }
-
-    // fn cmd_to_addr(&mut self, cmd: u8) -> u16 {
-    //     let addr_spec = cmd & !(0b111 << 5);
-    //     self.get_operand_address(match addr_spec {
-    //         0x9 => &AddrModes::Immd,
-    //         0x5 => &AddrModes::ZeroP,
-    //         0xD => &AddrModes::Abs,
-    //         0x1 => &AddrModes::IndrX,
-    //         0x11 => &AddrModes::IndrY,
-    //         0x19 => &AddrModes::AbsY,
-    //         0x15 => &AddrModes::ZeroPX,
-    //         0x1D => &AddrModes::AbsX,
-    //         _ => panic!("Unrecognized address mode {}", cmd),
-    //     })
-    // }
-
-    fn branch(&mut self, cond: bool) {
-        if cond {
-            self.memory.tick(1);
-            self.pc = self.get_operand_address(&AddrModes::Rel).0;
-        } else {
-            self.pc += 1;
-        }
-    }
-
-    fn add_with_carry(&mut self, data: u8) {
-        let mut result = self.a as u16 + data as u16;
-        if self.p.carry {
-            result += 1;
-        }
-        self.p.carry = result > 0xff;
-        self.p.ovflw = (self.a ^ result as u8) & (data ^ result as u8) & 0x80 != 0;
-
-        self.a = result as u8;
-        self.update_z_n(self.a);
-    }
-
-    fn adc(&mut self, addr: u16) {
-        let data = self.memory.read(addr);
-        self.add_with_carry(data);
-    }
-
-    fn and(&mut self, addr: u16) {
-        self.a &= self.memory.read(addr);
-        self.update_z_n(self.a);
-    }
-
-    fn bit(&mut self, addr: u16) {
-        let data = self.memory.read(addr);
-        self.p.zero = self.a & data == 0;
-        self.p.neg = data & (1 << 7) != 0;
-        self.p.ovflw = data & (1 << 6) != 0;
-    }
-
-    fn cmp(&mut self, reg: u8, addr: u16) {
-        let data = self.memory.read(addr);
-        self.p.carry = reg >= data;
-        self.update_z_n(reg.wrapping_sub(data));
-    }
-
-    fn eor(&mut self, addr: u16) {
-        let data = self.memory.read(addr);
-        self.a ^= data;
-        self.update_z_n(self.a);
-    }
-
-    fn lda(&mut self, addr: u16) {
-        self.a = self.memory.read(addr);
-        self.update_z_n(self.a);
-    }
-
-    fn ldx(&mut self, addr: u16) {
-        self.x = self.memory.read(addr);
-        self.update_z_n(self.x);
-    }
-
-    fn ldy(&mut self, addr: u16) {
-        self.y = self.memory.read(addr);
-        self.update_z_n(self.y);
-    }
-
-    fn sbc(&mut self, addr: u16) {
-        let data = self.memory.read(addr);
-        self.add_with_carry(((data as i8).wrapping_neg().wrapping_sub(1)) as u8);
-    }
-
-    fn nmi(&mut self) {
-        self.stack_push_u16(self.pc);
-        let mut flag = Status::new();
-        flag.from_data(self.p.to_data());
-
-        flag.brk = false;
-        flag.brk2 = true;
-
-        self.stack_push(flag.to_data());
-        self.p.intr_d = true;
-
-        self.memory.tick(2);
-        self.pc = self.memory.read_u16(0xFFFA);
-    }
-
-    pub fn load(&mut self, program: &Vec<u8>) {
-        self.memory.mass_write(0x0600, &program);
-        self.memory.write_u16(0xFFFC, 0x0600);
     }
 
     pub fn reset(&mut self) {
-        self.a = 0;
-        self.x = 0;
-        self.y = 0;
-        self.sp = STACK_INIT;
-        self.p.reset();
-
-        self.pc = self.memory.read_u16(0xFFFC);
+        self.sp = 0xFF;
+        self.p = 0x34;
+        self.interrupt(Interrupt::Reset);
     }
 
-    pub fn set_pc(&mut self, pc: u16) {
-        self.pc = pc;
+    // Push / Pop are for the stack
+    fn pop_byte(&mut self) -> u8 {
+        self.sp = self.sp.wrapping_add(1);
+        let address = 0x100 + self.sp as u16;
+        self.bus.read_byte(address)
     }
 
-    pub fn run(&mut self) {
-        self.run_with_callback(|_| {});
+    fn push_byte(&mut self, value: u8) {
+        let address = 0x100 + self.sp as u16;
+        self.bus.write_byte(address, value);
+        self.sp = self.sp.wrapping_sub(1);
     }
 
-    pub fn run_with_callback<F>(&mut self, mut callback: F)
-    where
-        F: FnMut(&mut Cpu),
-    {
-        loop {
-            if let Some(_nmi) = self.memory.poll_nmi() {
-                self.nmi();
-            }
-            callback(self);
+    fn push_word(&mut self, value: u16) {
+        self.push_byte((value >> 8) as u8);
+        self.push_byte(value as u8);
+    }
 
-            let cmd = self.memory.read(self.pc);
-            self.pc += 1;
+    fn pop_word(&mut self) -> u16 {
+        (self.pop_byte() as u16) | ((self.pop_byte() as u16) << 8)
+    }
 
-            let opcode = OPCODES_MAP
-                .get(&cmd)
-                .expect(&format!("Unrecognized opcode {}", cmd));
+    fn increment_pc(&mut self) {
+        self.pc = self.pc.wrapping_add(1);
+    }
 
-            match cmd {
-                // ADC
-                0x69 | 0x65 | 0x75 | 0x6D | 0x7D | 0x79 | 0x61 | 0x71 => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.adc(addr);
-                }
-                // AND
-                0x29 | 0x25 | 0x35 | 0x2d | 0x3d | 0x39 | 0x21 | 0x31 => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.and(addr)
-                }
-                // ASL
-                // Accumulator
-                0x0A => {
-                    self.p.carry = self.a & 0x80 != 0;
-                    self.a = self.a << 1;
-                    self.update_z_n(self.a);
-                }
-                // Memory
-                0x06 | 0x16 | 0x0E | 0x1E => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    self.p.carry = data & 0x80 != 0;
-                    data = data << 1;
-                    self.update_z_n(data);
-                    self.memory.write(addr, data);
-                }
-                // BCC
-                0x90 => self.branch(!self.p.carry),
-                // BCS
-                0xB0 => self.branch(self.p.carry),
-                // BEQ
-                0xF0 => self.branch(self.p.zero),
-                // BIT
-                0x24 | 0x2C => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
+    fn next_byte(&mut self) -> u8 {
+        let original_pc = self.pc;
+        self.increment_pc();
+        self.bus.read_byte(original_pc)
+    }
 
-                    self.bit(addr);
-                }
-                // BMI
-                0x30 => self.branch(self.p.neg),
-                // BNE
-                0xD0 => self.branch(!self.p.zero),
-                // BPL
-                0x10 => self.branch(!self.p.neg),
-                // BRK
-                0x00 => return,
-                // BVC
-                0x50 => self.branch(!self.p.ovflw),
-                // BVS
-                0x70 => self.branch(self.p.ovflw),
-                // CLC
-                0x18 => self.p.carry = false,
-                // CLD
-                0xD8 => self.p.dec = false,
-                // CLI
-                0x58 => self.p.intr_d = false,
-                // CLV
-                0xB8 => self.p.ovflw = false,
-                // CMP
-                0xC9 | 0xC5 | 0xD5 | 0xCD | 0xDD | 0xD9 | 0xC1 | 0xD1 => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.cmp(self.a, addr);
-                }
-                // CPX
-                0xE0 | 0xE4 | 0xEC => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    self.cmp(self.x, addr);
-                }
-                // CPY
-                0xC0 | 0xC4 | 0xCC => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    self.cmp(self.y, addr);
-                }
-                // DCP
-                0xC7 | 0xD7 | 0xCF | 0xDF | 0xDB | 0xD3 | 0xC3 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    data = data.wrapping_sub(1);
-                    self.memory.write(addr, data);
-                    if data <= self.a {
-                        self.p.carry = true;
-                    }
+    fn next_word(&mut self) -> u16 {
+        let original_pc = self.pc;
+        self.increment_pc();
+        self.increment_pc();
+        self.bus.read_word(original_pc)
+    }
 
-                    self.update_z_n(self.a.wrapping_sub(data));
-                }
-                // DEC
-                0xC6 | 0xD6 | 0xCE | 0xDE => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    data = data.wrapping_sub(1);
-                    self.update_z_n(data);
-                    self.memory.write(addr, data);
-                }
-                // DEX
-                0xCA => {
-                    self.x = self.x.wrapping_sub(1);
-                    self.update_z_n(self.x);
-                }
-                // DEY
-                0x88 => {
-                    self.y = self.y.wrapping_sub(1);
-                    self.update_z_n(self.y)
-                }
-                // EOR
-                0x49 | 0x45 | 0x55 | 0x4D | 0x5D | 0x59 | 0x41 | 0x51 => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.eor(addr);
-                }
-                // INC
-                0xE6 | 0xF6 | 0xEE | 0xFE => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    data = data.wrapping_add(1);
-                    self.update_z_n(data);
-                    self.memory.write(addr, data);
-                }
-                // INX
-                0xE8 => {
-                    self.x = self.x.wrapping_add(1);
-                    self.update_z_n(self.x)
-                }
-                // INY
-                0xC8 => {
-                    self.y = self.y.wrapping_add(1);
-                    self.update_z_n(self.y)
-                }
-                // ISB
-                0xE7 | 0xF7 | 0xEF | 0xFF | 0xFB | 0xE3 | 0xF3 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    data = data.wrapping_add(1);
-                    self.update_z_n(data);
-                    self.memory.write(addr, data);
-                    self.add_with_carry(((data as i8).wrapping_neg().wrapping_sub(1)) as u8);
-                }
-                // JMP absolute
-                0x4C => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    self.pc = self.memory.read_u16(addr);
-                }
-                // JMP indirect
-                0x6C => {
-                    let mem_address = self.memory.read_u16(self.pc);
+    // Flags
+    fn get_flag(&self, flag: Flag) -> bool {
+        self.p & (flag as u8) != 0
+    }
 
-                    let indirect_ref = if mem_address & 0x00FF == 0x00FF {
-                        let lo = self.memory.read(mem_address);
-                        let hi = self.memory.read(mem_address & 0xFF00);
-                        (hi as u16) << 8 | (lo as u16)
-                    } else {
-                        self.memory.read_u16(mem_address)
-                    };
-
-                    self.pc = indirect_ref;
-                }
-                // JSR
-                0x20 => {
-                    self.stack_push_u16(self.pc + 1);
-                    let addr = self.memory.read_u16(self.pc);
-                    self.pc = addr;
-                }
-                // LAX
-                0xA7 | 0xB7 | 0xAF | 0xBF | 0xA3 | 0xB3 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let data = self.memory.read(addr);
-                    self.a = data;
-                    self.update_z_n(self.a);
-                    self.x = self.a;
-                }
-                // LDA
-                0xA9 | 0xA5 | 0xB5 | 0xAD | 0xBD | 0xB9 | 0xA1 | 0xB1 => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.lda(addr);
-                }
-                // LDX
-                0xA2 | 0xA6 | 0xB6 | 0xAE | 0xBE => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.ldx(addr);
-                }
-                // LDY
-                0xA0 | 0xA4 | 0xB4 | 0xAC | 0xBC => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.ldy(addr);
-                }
-                // LSR
-                // Accumulator
-                0x4A => {
-                    self.p.carry = self.a & 1 == 1;
-                    self.a >>= 1;
-                    self.update_z_n(self.a);
-                }
-                // Memory
-                0x46 | 0x56 | 0x4E | 0x5E => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    self.p.carry = data & 1 == 1;
-                    data >>= 1;
-                    self.memory.write(addr, data);
-                    self.update_z_n(data);
-                }
-                // NOP
-                0xEA | 0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2
-                | 0xD2 | 0xF2 | 0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => {}
-                // NOP read
-                0x04 | 0x44 | 0x64 | 0x14 | 0x34 | 0x54 | 0x74 | 0xD4 | 0xF4 | 0x0C | 0x1C
-                | 0x3C | 0x5C | 0x7C | 0xDC | 0xFC => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let _data = self.memory.read(addr);
-                }
-                // ORA
-                0x09 | 0x05 | 0x15 | 0x0D | 0x1D | 0x19 | 0x01 | 0x11 => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    let data = self.memory.read(addr);
-                    self.a |= data;
-                    self.update_z_n(self.a);
-                }
-                // PHA
-                0x48 => self.stack_push(self.a),
-                // PHP
-                0x08 => {
-                    let mut status_cpy = Status::new();
-                    status_cpy.from_data(self.p.to_data());
-                    status_cpy.brk = true;
-                    status_cpy.brk2 = true;
-                    let data = status_cpy.to_data();
-                    self.stack_push(data);
-                }
-                // PLA
-                0x68 => {
-                    self.a = self.stack_pop();
-                    self.update_z_n(self.a)
-                }
-                // PLP
-                0x28 => {
-                    let data = self.stack_pop();
-                    self.p.from_data(data);
-                    self.p.brk = false;
-                    self.p.brk2 = true;
-                }
-                // RLA
-                0x27 | 0x37 | 0x2F | 0x3F | 0x3B | 0x33 | 0x23 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    let carry = self.p.carry;
-                    self.p.carry = data & (1 << 7) != 0;
-                    data <<= 1;
-                    if carry {
-                        data |= 1;
-                    }
-                    self.memory.write(addr, data);
-                    self.update_z_n(data);
-                    self.a &= data;
-                }
-                // ROL
-                // Accumulator
-                0x2A => {
-                    let carry = self.p.carry;
-                    self.p.carry = self.a & (1 << 7) != 0;
-                    self.a <<= 1;
-                    if carry {
-                        self.a |= 1;
-                    }
-                    self.update_z_n(self.a);
-                }
-                // Memory
-                0x26 | 0x36 | 0x2E | 0x3E => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    let carry = self.p.carry;
-                    self.p.carry = data & (1 << 7) != 0;
-                    data <<= 1;
-                    if carry {
-                        data |= 1;
-                    }
-                    self.memory.write(addr, data);
-                    self.update_z_n(data);
-                }
-                // ROR
-                // Accumulator
-                0x6A => {
-                    let carry = self.p.carry;
-                    self.p.carry = self.a & 1 == 1;
-                    self.a >>= 1;
-                    if carry {
-                        self.a |= 1 << 7;
-                    }
-                    self.update_z_n(self.a)
-                }
-                // Memory
-                0x66 | 0x76 | 0x6E | 0x7E => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    let carry = self.p.carry;
-                    self.p.carry = data & 1 == 1;
-                    data >>= 1;
-                    if carry {
-                        data |= 1 << 7;
-                    }
-                    self.memory.write(addr, data);
-                    self.update_z_n(data);
-                }
-                // RRA
-                0x67 | 0x77 | 0x6F | 0x7F | 0x7B | 0x63 | 0x73 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    let carry = self.p.carry;
-                    self.p.carry = data & 1 == 1;
-                    data >>= 1;
-                    if carry {
-                        data |= 1 << 7;
-                    }
-                    self.memory.write(addr, data);
-                    self.update_z_n(data);
-                    self.add_with_carry(data);
-                }
-                // RTI
-                0x40 => {
-                    let data = self.stack_pop();
-                    self.p.from_data(data);
-                    self.p.brk = false;
-                    self.p.brk2 = true;
-                    self.pc = self.stack_pop_u16();
-                }
-                // RTS
-                0x60 => {
-                    self.pc = self.stack_pop_u16();
-                    self.pc += 1;
-                }
-                // SAX
-                0x87 | 0x97 | 0x8F | 0x83 => {
-                    let data = self.a & self.x;
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    self.memory.write(addr, data);
-                }
-                // SBC
-                // Note: 0xEB is an unofficial opcode
-                0xE9 | 0xE5 | 0xF5 | 0xED | 0xFD | 0xF9 | 0xE1 | 0xF1 | 0xEB => {
-                    let (addr, cross_res) = self.get_operand_address(&opcode.mode);
-                    if cross_res {
-                        self.memory.tick(1);
-                    }
-                    self.sbc(addr);
-                }
-                // SEC
-                0x38 => self.p.carry = true,
-                // SED
-                0xF8 => self.p.dec = true,
-                // SEI
-                0x78 => self.p.intr_d = true,
-                // SKB
-                0x80 | 0x82 | 0x89 | 0xc2 | 0xe2 => {
-                    let _data = self.get_operand_address(&AddrModes::Immd);
-                }
-                // SLO
-                0x07 | 0x17 | 0x0F | 0x1F | 0x1B | 0x03 | 0x13 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    self.p.carry = data & 0x80 != 0;
-                    data = data << 1;
-                    self.update_z_n(data);
-                    self.memory.write(addr, data);
-                    self.a |= data;
-                    self.update_z_n(self.a);
-                }
-                // SRE
-                0x47 | 0x57 | 0x4F | 0x5F | 0x5B | 0x43 | 0x53 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    let mut data = self.memory.read(addr);
-                    self.p.carry = data & 1 == 1;
-                    data >>= 1;
-                    self.memory.write(addr, data);
-                    self.update_z_n(data);
-                    self.a ^= data;
-                    self.update_z_n(self.a);
-                }
-                // STA
-                0x85 | 0x95 | 0x8D | 0x9D | 0x99 | 0x81 | 0x91 => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    self.memory.write(addr, self.a);
-                }
-                // STX
-                0x86 | 0x96 | 0x8E => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    self.memory.write(addr, self.x);
-                }
-                // STY
-                0x84 | 0x94 | 0x8C => {
-                    let (addr, _) = self.get_operand_address(&opcode.mode);
-                    self.memory.write(addr, self.y);
-                }
-                // TAX
-                0xAA => {
-                    self.x = self.a;
-                    self.update_z_n(self.x)
-                }
-                // TAY
-                0xA8 => {
-                    self.y = self.a;
-                    self.update_z_n(self.y)
-                }
-                // TSX
-                0xBA => {
-                    self.x = self.sp;
-                    self.update_z_n(self.x)
-                }
-                // TXA
-                0x8A => {
-                    self.a = self.x;
-                    self.update_z_n(self.a)
-                }
-                // TXS
-                0x9A => self.sp = self.x,
-                // TYA
-                0x98 => {
-                    self.a = self.y;
-                    self.update_z_n(self.a)
-                }
-                _ => panic!(
-                    "Unrecognized command {:X} at PC {:X}\nPrevious cmds {:X} {:X}",
-                    cmd,
-                    self.pc,
-                    self.memory.read(self.pc - 1),
-                    self.memory.read(self.pc - 2)
-                ),
-            }
-
-            self.memory.tick(opcode.cycles);
+    fn set_flag(&mut self, flag: Flag, value: bool) {
+        if value {
+            self.p |= flag as u8;
+        } else {
+            self.p &= !(flag as u8);
         }
     }
 
-    pub fn insert_cartridge(&mut self, program: &Vec<u8>) {
-        self.load(program);
-        self.reset();
-        self.run();
+    fn set_flags_zero_negative(&mut self, value: u8) {
+        self.set_flag(Flag::Zero, value == 0);
+        self.set_flag(Flag::Negative, (value & 0b10000000) != 0);
+    }
+
+    fn set_flags_carry_overflow(&mut self, m: u8, n: u8, result: u16) {
+        self.set_flag(Flag::Carry, result > 0xFF);
+        let r = result as u8;
+        self.set_flag(Flag::Overflow, (m ^ r) & (n ^ r) & 0x80 != 0);
+    }
+
+    // Flags
+    fn carry(&self) -> u8 {
+        self.p & (Flag::Carry as u8)
+    }
+
+    // Assumes that the PC is on the first byte after the opcode
+    fn operand_address(&mut self, mode: Mode) -> u16 {
+        match mode {
+            Mode::Immediate => {
+                let original_pc = self.pc;
+                self.increment_pc();
+                original_pc
+            }
+            Mode::ZeroPage => self.next_byte() as u16,
+            Mode::ZeroPageX => {
+                self.bus.tick();
+                low_byte(offset(self.next_byte(), self.x))
+            }
+            Mode::ZeroPageY => {
+                self.bus.tick();
+                low_byte(offset(self.next_byte(), self.y))
+            }
+            Mode::Absolute => self.next_word(),
+            Mode::AbsoluteX => {
+                let base = self.next_word();
+                if cross(base, self.x) {
+                    self.bus.tick();
+                };
+                offset(base, self.x)
+            }
+            Mode::AbsoluteXForceTick => {
+                self.bus.tick();
+                offset(self.next_word(), self.x)
+            }
+            Mode::AbsoluteY => {
+                let base = self.next_word();
+                if cross(base, self.y) {
+                    self.bus.tick();
+                }
+                offset(base, self.y)
+            }
+            Mode::AbsoluteYForceTick => {
+                self.bus.tick();
+                offset(self.next_word(), self.y)
+            }
+            Mode::Indirect => {
+                let i = self.next_word();
+                self.bus
+                    .read_noncontinuous_word(i, high_byte(i) | low_byte(i + 1))
+            }
+            Mode::IndirectX => {
+                self.bus.tick();
+                let i = offset(self.next_byte(), self.x);
+                self.bus
+                    .read_noncontinuous_word(low_byte(i), low_byte(i + 1))
+            }
+            Mode::IndirectY => {
+                let i = self.next_byte();
+                let base = self.bus.read_noncontinuous_word(i, low_byte(i + 1));
+                if cross(base, self.y) {
+                    self.bus.tick();
+                }
+                offset(base, self.y)
+            }
+            Mode::IndirectYForceTick => {
+                let i = self.next_byte();
+                let base = self.bus.read_noncontinuous_word(i, low_byte(i + 1));
+                self.bus.tick();
+                offset(base, self.y)
+            }
+            Mode::NoMode => panic!("Mode::NoMode should never be used to read from memory"),
+        }
+    }
+
+    fn read_operand(&mut self, mode: Mode) -> u8 {
+        let address = self.operand_address(mode);
+        self.bus.read_byte(address)
+    }
+
+    fn interrupt(&mut self, kind: Interrupt) {
+        let (ticks, push, address, flags) = match kind {
+            Interrupt::Nmi => (2, true, 0xFFFAu16, vec![Flag::IrqDisable]),
+            Interrupt::Reset => (5, false, 0xFFFCu16, vec![]),
+            Interrupt::Irq => (2, true, 0xFFFEu16, vec![Flag::IrqDisable]),
+            Interrupt::Break => (1, true, 0xFFFEu16, vec![Flag::IrqDisable]),
+        };
+
+        for _ in 0..ticks {
+            self.bus.tick();
+        }
+
+        if push {
+            let pc = self.pc;
+            // The Break and Push flags only exist in registers pushed to
+            // the stack, never in the actual P register.
+            let mut p = self.p | Flag::Push as u8;
+            if let Interrupt::Break = kind {
+                p |= Flag::Break as u8;
+            }
+            self.push_word(pc);
+            self.push_byte(p);
+        }
+
+        for f in flags {
+            self.set_flag(f, true);
+        }
+
+        self.pc = self.bus.read_word(address);
+    }
+
+    #[allow(dead_code)]
+    pub fn log_next_instruction(&mut self) {
+        let pc = self.pc;
+        let rom_offset = 15 + (self.pc % 0x4000);
+        let opcode = self.bus.unclocked_read_byte(pc) as usize;
+        let mut args = String::new();
+        for i in 1..INSTRUCTION_SIZES[opcode] {
+            write!(&mut args, "{:02X} ", self.bus.unclocked_read_byte(pc + i)).expect("it to work");
+        }
+        println!(
+            "OFFSET:{:06x}\tPC:{:04x}\tA:{:02x}\tX:{:02x}\tY:{:02x}\tP:{:08b}\tTEST:{:02x}\t[{:02x}] {}\t{}",
+            rom_offset,
+            pc,
+            self.a,
+            self.x,
+            self.y,
+            self.p,
+            self.bus.unclocked_read_byte(0x6000),
+            opcode,
+            INSTRUCTION_NAMES[opcode as usize],
+            args,
+        );
+    }
+
+    pub fn execute_next_instruction(&mut self) {
+        if self.bus.nmi.ready() {
+            self.bus.nmi.acknowledge();
+            self.interrupt(Interrupt::Nmi)
+        } else if self.bus.irq() && !self.get_flag(Flag::IrqDisable) {
+            self.interrupt(Interrupt::Irq)
+        }
+
+        #[cfg(feature = "log")]
+        self.log_next_instruction();
+
+        let instruction = self.next_byte();
+        self.execute_instruction(instruction);
+    }
+
+    fn execute_instruction(&mut self, opcode: u8) {
+        match opcode {
+            // Loads
+            0xa1 => self.lda(Mode::IndirectX),
+            0xa5 => self.lda(Mode::ZeroPage),
+            0xa9 => self.lda(Mode::Immediate),
+            0xad => self.lda(Mode::Absolute),
+            0xb1 => self.lda(Mode::IndirectY),
+            0xb5 => self.lda(Mode::ZeroPageX),
+            0xb9 => self.lda(Mode::AbsoluteY),
+            0xbd => self.lda(Mode::AbsoluteX),
+
+            0xa2 => self.ldx(Mode::Immediate),
+            0xa6 => self.ldx(Mode::ZeroPage),
+            0xb6 => self.ldx(Mode::ZeroPageY),
+            0xae => self.ldx(Mode::Absolute),
+            0xbe => self.ldx(Mode::AbsoluteY),
+
+            0xa0 => self.ldy(Mode::Immediate),
+            0xa4 => self.ldy(Mode::ZeroPage),
+            0xb4 => self.ldy(Mode::ZeroPageX),
+            0xac => self.ldy(Mode::Absolute),
+            0xbc => self.ldy(Mode::AbsoluteX),
+
+            // Stores
+            0x85 => self.sta(Mode::ZeroPage),
+            0x95 => self.sta(Mode::ZeroPageX),
+            0x8d => self.sta(Mode::Absolute),
+            0x9d => self.sta(Mode::AbsoluteXForceTick),
+            0x99 => self.sta(Mode::AbsoluteYForceTick),
+            0x81 => self.sta(Mode::IndirectX),
+            0x91 => self.sta(Mode::IndirectYForceTick),
+
+            0x86 => self.stx(Mode::ZeroPage),
+            0x96 => self.stx(Mode::ZeroPageY),
+            0x8e => self.stx(Mode::Absolute),
+
+            0x84 => self.sty(Mode::ZeroPage),
+            0x94 => self.sty(Mode::ZeroPageX),
+            0x8c => self.sty(Mode::Absolute),
+
+            // Arithmetic
+            0x69 => self.adc(Mode::Immediate),
+            0x65 => self.adc(Mode::ZeroPage),
+            0x75 => self.adc(Mode::ZeroPageX),
+            0x6d => self.adc(Mode::Absolute),
+            0x7d => self.adc(Mode::AbsoluteX),
+            0x79 => self.adc(Mode::AbsoluteY),
+            0x61 => self.adc(Mode::IndirectX),
+            0x71 => self.adc(Mode::IndirectY),
+
+            0xe9 => self.sbc(Mode::Immediate),
+            0xe5 => self.sbc(Mode::ZeroPage),
+            0xf5 => self.sbc(Mode::ZeroPageX),
+            0xed => self.sbc(Mode::Absolute),
+            0xfd => self.sbc(Mode::AbsoluteX),
+            0xf9 => self.sbc(Mode::AbsoluteY),
+            0xe1 => self.sbc(Mode::IndirectX),
+            0xf1 => self.sbc(Mode::IndirectY),
+
+            // Comparisons
+            0xc9 => self.cmp(Mode::Immediate),
+            0xc5 => self.cmp(Mode::ZeroPage),
+            0xd5 => self.cmp(Mode::ZeroPageX),
+            0xcd => self.cmp(Mode::Absolute),
+            0xdd => self.cmp(Mode::AbsoluteX),
+            0xd9 => self.cmp(Mode::AbsoluteY),
+            0xc1 => self.cmp(Mode::IndirectX),
+            0xd1 => self.cmp(Mode::IndirectY),
+
+            0xe0 => self.cpx(Mode::Immediate),
+            0xe4 => self.cpx(Mode::ZeroPage),
+            0xec => self.cpx(Mode::Absolute),
+
+            0xc0 => self.cpy(Mode::Immediate),
+            0xc4 => self.cpy(Mode::ZeroPage),
+            0xcc => self.cpy(Mode::Absolute),
+
+            // Bitwise operations
+            0x29 => self.and(Mode::Immediate),
+            0x25 => self.and(Mode::ZeroPage),
+            0x35 => self.and(Mode::ZeroPageX),
+            0x2d => self.and(Mode::Absolute),
+            0x3d => self.and(Mode::AbsoluteX),
+            0x39 => self.and(Mode::AbsoluteY),
+            0x21 => self.and(Mode::IndirectX),
+            0x31 => self.and(Mode::IndirectY),
+
+            0x09 => self.ora(Mode::Immediate),
+            0x05 => self.ora(Mode::ZeroPage),
+            0x15 => self.ora(Mode::ZeroPageX),
+            0x0d => self.ora(Mode::Absolute),
+            0x1d => self.ora(Mode::AbsoluteX),
+            0x19 => self.ora(Mode::AbsoluteY),
+            0x01 => self.ora(Mode::IndirectX),
+            0x11 => self.ora(Mode::IndirectY),
+
+            0x49 => self.eor(Mode::Immediate),
+            0x45 => self.eor(Mode::ZeroPage),
+            0x55 => self.eor(Mode::ZeroPageX),
+            0x4d => self.eor(Mode::Absolute),
+            0x5d => self.eor(Mode::AbsoluteX),
+            0x59 => self.eor(Mode::AbsoluteY),
+            0x41 => self.eor(Mode::IndirectX),
+            0x51 => self.eor(Mode::IndirectY),
+
+            0x24 => self.bit(Mode::ZeroPage),
+            0x2c => self.bit(Mode::Absolute),
+
+            // Shifts and rotates
+            0x2a => self.rol_a(),
+            0x26 => self.rol(Mode::ZeroPage),
+            0x36 => self.rol(Mode::ZeroPageX),
+            0x2e => self.rol(Mode::Absolute),
+            0x3e => self.rol(Mode::AbsoluteXForceTick),
+
+            0x6a => self.ror_a(),
+            0x66 => self.ror(Mode::ZeroPage),
+            0x76 => self.ror(Mode::ZeroPageX),
+            0x6e => self.ror(Mode::Absolute),
+            0x7e => self.ror(Mode::AbsoluteXForceTick),
+
+            0x0a => self.asl_a(),
+            0x06 => self.asl(Mode::ZeroPage),
+            0x16 => self.asl(Mode::ZeroPageX),
+            0x0e => self.asl(Mode::Absolute),
+            0x1e => self.asl(Mode::AbsoluteXForceTick),
+
+            0x4a => self.lsr_a(),
+            0x46 => self.lsr(Mode::ZeroPage),
+            0x56 => self.lsr(Mode::ZeroPageX),
+            0x4e => self.lsr(Mode::Absolute),
+            0x5e => self.lsr(Mode::AbsoluteXForceTick),
+
+            // Increments and decrements
+            0xe6 => self.inc(Mode::ZeroPage),
+            0xf6 => self.inc(Mode::ZeroPageX),
+            0xee => self.inc(Mode::Absolute),
+            0xfe => self.inc(Mode::AbsoluteXForceTick),
+
+            0xc6 => self.dec(Mode::ZeroPage),
+            0xd6 => self.dec(Mode::ZeroPageX),
+            0xce => self.dec(Mode::Absolute),
+            0xde => self.dec(Mode::AbsoluteXForceTick),
+
+            0xe8 => self.inx(),
+            0xca => self.dex(),
+            0xc8 => self.iny(),
+            0x88 => self.dey(),
+
+            // Register moves
+            0xaa => self.tax(),
+            0xa8 => self.tay(),
+            0x8a => self.txa(),
+            0x98 => self.tya(),
+            0x9a => self.txs(),
+            0xba => self.tsx(),
+
+            // Flag operations
+            0x18 => self.clc(),
+            0x38 => self.sec(),
+            0x58 => self.cli(),
+            0x78 => self.sei(),
+            0xb8 => self.clv(),
+            0xd8 => self.cld(),
+            0xf8 => self.sed(),
+
+            // Branches
+            0x10 => self.bpl(),
+            0x30 => self.bmi(),
+            0x50 => self.bvc(),
+            0x70 => self.bvs(),
+            0x90 => self.bcc(),
+            0xb0 => self.bcs(),
+            0xd0 => self.bne(),
+            0xf0 => self.beq(),
+
+            // Jumps
+            0x4c => self.jmp(Mode::Absolute),
+            0x6c => self.jmp(Mode::Indirect),
+
+            // Procedure calls
+            0x20 => self.jsr(),
+            0x60 => self.rts(),
+            0x00 => self.brk(),
+            0x40 => self.rti(),
+
+            // Stack operations
+            0x48 => self.pha(),
+            0x68 => self.pla(),
+            0x08 => self.php(),
+            0x28 => self.plp(),
+
+            // No operation
+            0xea => self.nop(),
+
+            // Undocumented Operations
+            0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => self.nop(),
+
+            0x0C => self.nop_read(Mode::Absolute),
+
+            0x1C | 0x3C | 0x5C | 0x7C | 0xDC | 0xFC => self.nop_read(Mode::AbsoluteX),
+            0x04 | 0x44 | 0x64 => self.nop_read(Mode::ZeroPage),
+            0x14 | 0x34 | 0x54 | 0x74 | 0xd4 | 0xf4 => self.nop_read(Mode::ZeroPageX),
+            0x80 | 0x82 | 0x89 | 0xc2 | 0xe2 => self.nop_read(Mode::Immediate),
+
+            0x07 => self.slo(Mode::ZeroPage),
+            0x17 => self.slo(Mode::ZeroPageX),
+            0x03 => self.slo(Mode::IndirectX),
+            0x13 => self.slo(Mode::IndirectY),
+            0x0F => self.slo(Mode::Absolute),
+            0x1F => self.slo(Mode::AbsoluteX),
+            0x1B => self.slo(Mode::AbsoluteY),
+
+            0x27 => self.rla(Mode::ZeroPage),
+            0x37 => self.rla(Mode::ZeroPageX),
+            0x23 => self.rla(Mode::IndirectX),
+            0x33 => self.rla(Mode::IndirectY),
+            0x2F => self.rla(Mode::Absolute),
+            0x3F => self.rla(Mode::AbsoluteX),
+            0x3B => self.rla(Mode::AbsoluteY),
+
+            0x47 => self.sre(Mode::ZeroPage),
+            0x57 => self.sre(Mode::ZeroPageX),
+            0x43 => self.sre(Mode::IndirectX),
+            0x53 => self.sre(Mode::IndirectY),
+            0x4F => self.sre(Mode::Absolute),
+            0x5F => self.sre(Mode::AbsoluteX),
+            0x5B => self.sre(Mode::AbsoluteY),
+
+            0x67 => self.rra(Mode::ZeroPage),
+            0x77 => self.rra(Mode::ZeroPageX),
+            0x63 => self.rra(Mode::IndirectX),
+            0x73 => self.rra(Mode::IndirectY),
+            0x6F => self.rra(Mode::Absolute),
+            0x7F => self.rra(Mode::AbsoluteX),
+            0x7B => self.rra(Mode::AbsoluteY),
+
+            0x87 => self.sax(Mode::ZeroPage),
+            0x97 => self.sax(Mode::ZeroPageY),
+            0x83 => self.sax(Mode::IndirectX),
+            0x8F => self.sax(Mode::Absolute),
+
+            0xA7 => self.lax(Mode::ZeroPage),
+            0xB7 => self.lax(Mode::ZeroPageY),
+            0xA3 => self.lax(Mode::IndirectX),
+            0xB3 => self.lax(Mode::IndirectY),
+            0xAF => self.lax(Mode::Absolute),
+            0xBF => self.lax(Mode::AbsoluteY),
+
+            0xC7 => self.dcp(Mode::ZeroPage),
+            0xD7 => self.dcp(Mode::ZeroPageX),
+            0xC3 => self.dcp(Mode::IndirectX),
+            0xD3 => self.dcp(Mode::IndirectY),
+            0xCF => self.dcp(Mode::Absolute),
+            0xDF => self.dcp(Mode::AbsoluteX),
+            0xDB => self.dcp(Mode::AbsoluteY),
+
+            0xE7 => self.isc(Mode::ZeroPage),
+            0xF7 => self.isc(Mode::ZeroPageX),
+            0xE3 => self.isc(Mode::IndirectX),
+            0xF3 => self.isc(Mode::IndirectY),
+            0xEF => self.isc(Mode::Absolute),
+            0xFF => self.isc(Mode::AbsoluteX),
+            0xFB => self.isc(Mode::AbsoluteY),
+
+            0x0B | 0x2B => self.anc(),
+            0x4B => self.alr(),
+            0x6B => self.arr(),
+            0x8B => self.xaa(),
+            0xAB => self.lxa(),
+            0xCB => self.axs(),
+            0xEB => self.sbc_nop(),
+            0x93 => self.ahx(Mode::IndirectY),
+            0x9F => self.ahx(Mode::AbsoluteY),
+            0x9c => self.shy(),
+            0x9e => self.shx(),
+            0x9b => self.tas(Mode::AbsoluteY),
+            0xbb => self.las(Mode::AbsoluteY),
+
+            0x02 => println!("----------------PING----------------------"),
+
+            _ => panic!("unimplemented or illegal instruction: 0x{:X}", opcode),
+        }
+    }
+
+    // Loads
+    fn lda(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        self.set_flags_zero_negative(operand);
+        self.a = operand;
+    }
+
+    fn ldx(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        self.set_flags_zero_negative(operand);
+        self.x = operand;
+    }
+
+    fn ldy(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        self.set_flags_zero_negative(operand);
+        self.y = operand;
+    }
+
+    // Stores
+    fn sta(&mut self, mode: Mode) {
+        let address = self.operand_address(mode);
+        let value = self.a;
+        self.bus.write_byte(address, value);
+    }
+
+    fn stx(&mut self, mode: Mode) {
+        let address = self.operand_address(mode);
+        let value = self.x;
+        self.bus.write_byte(address, value);
+    }
+
+    fn sty(&mut self, mode: Mode) {
+        let address = self.operand_address(mode);
+        let value = self.y;
+        self.bus.write_byte(address, value);
+    }
+
+    // Math
+
+    fn adc(&mut self, mode: Mode) {
+        let a = self.a;
+        let operand = self.read_operand(mode);
+        let result = a as u16 + operand as u16 + self.carry() as u16;
+        self.set_flags_carry_overflow(a, operand, result);
+        self.set_flags_zero_negative(result as u8);
+        self.a = result as u8;
+    }
+
+    fn sbc(&mut self, mode: Mode) {
+        let a = self.a;
+        let operand = !self.read_operand(mode);
+        let result = a as u16 + operand as u16 + self.carry() as u16;
+        self.set_flags_carry_overflow(a, operand, result);
+        self.set_flags_zero_negative(result as u8);
+        self.a = result as u8;
+    }
+
+    fn cmp(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        let a = self.a;
+        self.set_flags_zero_negative(a.wrapping_sub(operand));
+        self.set_flag(Flag::Carry, a >= operand);
+    }
+
+    fn cpx(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        let x = self.x;
+        self.set_flags_zero_negative(x.wrapping_sub(operand));
+        self.set_flag(Flag::Carry, x >= operand);
+    }
+
+    fn cpy(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        let y = self.y;
+        self.set_flags_zero_negative(y.wrapping_sub(operand));
+        self.set_flag(Flag::Carry, y >= operand);
+    }
+
+    fn and(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        let result = self.a & operand;
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn ora(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        let result = self.a | operand;
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn eor(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        let result = self.a ^ operand;
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn bit(&mut self, mode: Mode) {
+        let operand = self.read_operand(mode);
+        let result = self.a & operand;
+        self.set_flag(Flag::Zero, result == 0);
+        self.set_flag(Flag::Overflow, operand & 0b01000000 != 0);
+        self.set_flag(Flag::Negative, operand & 0b10000000 != 0);
+    }
+
+    fn rol(&mut self, mode: Mode) {
+        self.do_rol(mode);
+    }
+
+    fn do_rol(&mut self, mode: Mode) -> u8 {
+        let address = self.operand_address(mode);
+        let operand = self.bus.read_byte(address);
+        let result = (operand << 1) | self.carry();
+        self.set_flag(Flag::Carry, operand & 0b10000000 != 0);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.bus.write_byte(address, result);
+        result
+    }
+
+    fn rol_a(&mut self) {
+        let operand = self.a;
+        let result = (operand << 1) | self.carry();
+        self.set_flag(Flag::Carry, operand & 0b10000000 != 0);
+        self.set_flags_zero_negative(result);
+        self.a = result;
+        self.bus.tick();
+    }
+
+    fn ror(&mut self, mode: Mode) {
+        self.do_ror(mode);
+    }
+
+    fn do_ror(&mut self, mode: Mode) -> u8 {
+        let address = self.operand_address(mode);
+        let operand = self.bus.read_byte(address);
+        let result = (operand >> 1) | (self.carry() << 7);
+        self.set_flag(Flag::Carry, operand & 1 != 0);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.bus.write_byte(address, result);
+        result
+    }
+
+    fn ror_a(&mut self) {
+        let operand = self.a;
+        let result = (operand >> 1) | (self.carry() << 7);
+        self.set_flag(Flag::Carry, operand & 1 != 0);
+        self.set_flags_zero_negative(result);
+        self.a = result;
+        self.bus.tick();
+    }
+
+    fn asl(&mut self, mode: Mode) {
+        self.do_asl(mode);
+    }
+
+    fn do_asl(&mut self, mode: Mode) -> u8 {
+        let address = self.operand_address(mode);
+        let operand = self.bus.read_byte(address);
+        let result = operand << 1;
+        self.set_flag(Flag::Carry, operand & 0b10000000 != 0);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.bus.write_byte(address, result);
+        result
+    }
+
+    fn asl_a(&mut self) {
+        let operand = self.a;
+        let result = operand << 1;
+        self.set_flag(Flag::Carry, operand & 0b10000000 != 0);
+        self.set_flags_zero_negative(result);
+        self.a = result;
+        self.bus.tick();
+    }
+
+    fn lsr(&mut self, mode: Mode) {
+        self.do_lsr(mode);
+    }
+
+    fn do_lsr(&mut self, mode: Mode) -> u8 {
+        let address = self.operand_address(mode);
+        let operand = self.bus.read_byte(address);
+        let result = operand >> 1;
+        self.set_flag(Flag::Carry, operand & 1 != 0);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.bus.write_byte(address, result);
+        result
+    }
+
+    fn lsr_a(&mut self) {
+        let operand = self.a;
+        let result = operand >> 1;
+        self.set_flag(Flag::Carry, operand & 1 != 0);
+        self.set_flags_zero_negative(result);
+        self.a = result;
+        self.bus.tick();
+    }
+
+    fn inc(&mut self, mode: Mode) {
+        self.do_inc(mode);
+    }
+
+    fn do_inc(&mut self, mode: Mode) -> u8 {
+        let address = self.operand_address(mode);
+        let operand = self.bus.read_byte(address);
+        let result = operand.wrapping_add(1);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.bus.write_byte(address, result);
+        result
+    }
+
+    fn dec(&mut self, mode: Mode) {
+        self.do_dec(mode);
+    }
+
+    fn do_dec(&mut self, mode: Mode) -> u8 {
+        let address = self.operand_address(mode);
+        let operand = self.bus.read_byte(address);
+        let result = operand.wrapping_sub(1);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.bus.write_byte(address, result);
+        result
+    }
+
+    fn inx(&mut self) {
+        let result = self.x.wrapping_add(1);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.x = result;
+    }
+
+    fn dex(&mut self) {
+        let result = self.x.wrapping_sub(1);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.x = result;
+    }
+
+    fn iny(&mut self) {
+        let result = self.y.wrapping_add(1);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.y = result;
+    }
+
+    fn dey(&mut self) {
+        let result = self.y.wrapping_sub(1);
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.y = result;
+    }
+
+    fn tax(&mut self) {
+        let result = self.a;
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.x = result;
+    }
+
+    fn tay(&mut self) {
+        let result = self.a;
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.y = result;
+    }
+
+    fn txa(&mut self) {
+        let result = self.x;
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn tya(&mut self) {
+        let result = self.y;
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn txs(&mut self) {
+        let result = self.x;
+        self.bus.tick();
+        self.sp = result;
+    }
+
+    fn tsx(&mut self) {
+        let result = self.sp;
+        self.bus.tick();
+        self.set_flags_zero_negative(result);
+        self.x = result;
+    }
+
+    fn clc(&mut self) {
+        self.set_flag(Flag::Carry, false);
+        self.bus.tick();
+    }
+
+    fn sec(&mut self) {
+        self.set_flag(Flag::Carry, true);
+        self.bus.tick();
+    }
+
+    fn cli(&mut self) {
+        self.set_flag(Flag::IrqDisable, false);
+        self.bus.tick();
+    }
+
+    fn sei(&mut self) {
+        self.set_flag(Flag::IrqDisable, true);
+        self.bus.tick();
+    }
+
+    fn clv(&mut self) {
+        self.set_flag(Flag::Overflow, false);
+        self.bus.tick();
+    }
+
+    fn cld(&mut self) {
+        self.set_flag(Flag::Decimal, false);
+        self.bus.tick();
+    }
+
+    fn sed(&mut self) {
+        self.set_flag(Flag::Decimal, true);
+        self.bus.tick();
+    }
+
+    fn branch(&mut self, condition: bool) {
+        // The operand is a signed 8-bit value. The `as i8 as u16` is there
+        // to create a 16-bit twos-compliment representation of the operand.
+        // Just casting directly to u16 doesn't work.
+        let offset = self.read_operand(Mode::Immediate) as i8 as u16;
+
+        if condition {
+            self.bus.tick();
+
+            let new_pc = self.pc.wrapping_add(offset);
+
+            // An extra tick for page crosses.
+            if high_byte(self.pc) != high_byte(new_pc) {
+                self.bus.tick();
+            }
+
+            self.pc = new_pc;
+        }
+    }
+
+    fn bpl(&mut self) {
+        let negative = self.get_flag(Flag::Negative);
+        self.branch(!negative);
+    }
+
+    fn bmi(&mut self) {
+        let negative = self.get_flag(Flag::Negative);
+        self.branch(negative);
+    }
+
+    fn bvc(&mut self) {
+        let overflow = self.get_flag(Flag::Overflow);
+        self.branch(!overflow);
+    }
+
+    fn bvs(&mut self) {
+        let overflow = self.get_flag(Flag::Overflow);
+        self.branch(overflow);
+    }
+
+    fn bcc(&mut self) {
+        let carry = self.get_flag(Flag::Carry);
+        self.branch(!carry);
+    }
+
+    fn bcs(&mut self) {
+        let carry = self.get_flag(Flag::Carry);
+        self.branch(carry);
+    }
+
+    fn bne(&mut self) {
+        let zero = self.get_flag(Flag::Zero);
+        self.branch(!zero);
+    }
+
+    fn beq(&mut self) {
+        let zero = self.get_flag(Flag::Zero);
+        self.branch(zero);
+    }
+
+    fn jmp(&mut self, mode: Mode) {
+        self.pc = self.operand_address(mode);
+    }
+
+    fn jsr(&mut self) {
+        let target_address = self.operand_address(Mode::Absolute);
+        let return_address = self.pc - 1;
+        self.bus.tick();
+        self.push_word(return_address);
+        self.pc = target_address;
+    }
+
+    fn rts(&mut self) {
+        self.bus.tick();
+        self.bus.tick();
+        self.pc = self.pop_word() + 1;
+        self.bus.tick();
+    }
+
+    fn brk(&mut self) {
+        self.pc += 1;
+        self.interrupt(Interrupt::Break);
+    }
+
+    fn rti(&mut self) {
+        self.p = self.pop_byte();
+        self.pc = self.pop_word();
+    }
+
+    fn pha(&mut self) {
+        self.bus.tick();
+        let a = self.a;
+        self.push_byte(a);
+    }
+
+    fn pla(&mut self) {
+        self.bus.tick();
+        self.bus.tick();
+        let result = self.pop_byte();
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn php(&mut self) {
+        self.bus.tick();
+        // See http://wiki.nesdev.com/w/index.php/CPU_status_flag_behavior
+        let p = self.p | Flag::Push as u8 | Flag::Break as u8;
+        self.push_byte(p);
+    }
+
+    fn plp(&mut self) {
+        self.bus.tick();
+        self.bus.tick();
+        // Push and break flags are never set in the actual P register.
+        self.p = self.pop_byte() & !(Flag::Push as u8 | Flag::Break as u8);
+    }
+
+    fn nop(&mut self) {
+        self.bus.tick();
+    }
+
+    fn slo(&mut self, mode: Mode) {
+        let result = self.a | self.do_asl(mode);
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn rla(&mut self, mode: Mode) {
+        let result = self.a & self.do_rol(mode);
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn sre(&mut self, mode: Mode) {
+        let result = self.a ^ self.do_lsr(mode);
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn rra(&mut self, mode: Mode) {
+        let a = self.a;
+        let operand = self.do_ror(mode);
+        let result = a as u16 + operand as u16 + self.carry() as u16;
+        self.set_flags_carry_overflow(a, operand, result);
+        self.set_flags_zero_negative(result as u8);
+        self.a = result as u8;
+    }
+
+    fn sax(&mut self, mode: Mode) {
+        let address = self.operand_address(mode);
+        let result = self.a & self.x;
+        self.bus.write_byte(address, result);
+    }
+
+    fn lax(&mut self, mode: Mode) {
+        self.lda(mode);
+        self.x = self.a;
+    }
+
+    fn dcp(&mut self, mode: Mode) {
+        let result = self.do_dec(mode);
+        let a = self.a;
+        self.set_flags_zero_negative(a.wrapping_sub(result));
+        self.set_flag(Flag::Carry, a >= result);
+    }
+
+    fn isc(&mut self, mode: Mode) {
+        let operand = !self.do_inc(mode);
+        let a = self.a;
+        let result = a as u16 + operand as u16 + self.carry() as u16;
+        self.set_flags_carry_overflow(a, operand, result);
+        self.set_flags_zero_negative(result as u8);
+        self.a = result as u8;
+    }
+
+    fn anc(&mut self) {
+        let operand = self.read_operand(Mode::Immediate);
+        let result = self.a & operand;
+        self.set_flags_zero_negative(result);
+        self.set_flag(Flag::Carry, result & 0b1000_0000 != 0);
+        self.a = result;
+    }
+
+    fn alr(&mut self) {
+        let operand = self.read_operand(Mode::Immediate);
+        let mut result = self.a & operand;
+        self.set_flag(Flag::Carry, result & 1 == 1);
+        result >>= 1;
+        self.set_flags_zero_negative(result);
+        self.a = result;
+    }
+
+    fn arr(&mut self) {
+        let operand = self.read_operand(Mode::Immediate);
+        let result = ((self.a & operand) >> 1) | (self.carry() << 7);
+
+        let bit_6 = (result >> 6) & 1;
+        let bit_5 = (result >> 5) & 1;
+        self.set_flag(Flag::Carry, bit_6 == 1);
+        self.set_flag(Flag::Overflow, bit_6 ^ bit_5 == 1);
+        self.set_flags_zero_negative(result);
+
+        self.a = result;
+    }
+
+    fn xaa(&mut self) {
+        self.txa();
+        self.and(Mode::Immediate);
+    }
+
+    fn lxa(&mut self) {
+        self.lda(Mode::Immediate);
+        self.tax();
+    }
+
+    fn axs(&mut self) {
+        let a = self.a;
+        let x = self.x;
+        let operand = self.read_operand(Mode::Immediate);
+        let result = (a & x).wrapping_sub(operand);
+        self.set_flag(Flag::Carry, (a & x) >= operand);
+        self.set_flags_zero_negative(result);
+        self.x = result as u8;
+    }
+
+    fn sbc_nop(&mut self) {
+        self.sbc(Mode::Immediate);
+        self.nop();
+    }
+
+    fn ahx(&mut self, mode: Mode) {
+        let address = self.operand_address(mode);
+        let result = self.a & self.x & (address >> 8) as u8;
+        self.bus.write_byte(address, result);
+    }
+
+    fn shx(&mut self) {
+        let mut address = self.operand_address(Mode::AbsoluteY);
+        if cross(address - self.y as u16, self.y) {
+            address &= (self.x as u16) << 8;
+        }
+        let result = self.x & ((address >> 8) as u8 + 1);
+        self.bus.write_byte(address, result);
+    }
+
+    fn shy(&mut self) {
+        let mut address = self.operand_address(Mode::AbsoluteX);
+        if cross(address - self.x as u16, self.x) {
+            address &= (self.y as u16) << 8;
+        }
+        let result = self.y & ((address >> 8) as u8 + 1);
+        self.bus.write_byte(address, result);
+    }
+
+    fn tas(&mut self, mode: Mode) {
+        let address = self.operand_address(mode);
+        self.sp = self.x & self.a;
+        let result = self.sp & ((address >> 8) as u8 + 1);
+        self.bus.write_byte(address, result);
+    }
+    fn las(&mut self, mode: Mode) {
+        let result = self.read_operand(mode) & self.sp;
+        self.a = result;
+        self.x = result;
+        self.sp = result;
+        self.set_flags_zero_negative(result);
+    }
+
+    fn nop_read(&mut self, mode: Mode) {
+        self.read_operand(mode);
     }
 }
+
+fn cross(base: u16, offset: u8) -> bool {
+    high_byte(base + offset as u16) != high_byte(base)
+}
+
+fn offset<T: Into<u16>>(base: T, offset: u8) -> u16 {
+    base.into() + offset as u16
+}
+
+fn low_byte<T: Into<u16>>(value: T) -> u16 {
+    value.into() & 0xFF
+}
+
+fn high_byte(value: u16) -> u16 {
+    value & 0xFF00
+}
+
+// fn bytes_to_word(low: u8, high: u8) -> u16 {
+//     (low as u16) | (high as u16) << 8
+// }
+
+#[cfg(test)]
+mod test;
